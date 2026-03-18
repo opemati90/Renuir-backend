@@ -11,6 +11,7 @@ const { ImageAnnotatorClient } = require('@google-cloud/vision');
 const { pool } = require('../utils/db');
 const { authenticateToken } = require('../middleware/auth');
 const { checkUploadQuota } = require('../middleware/uploadQuota');
+const { generateMatchesForItem } = require('../utils/matching');
 
 const storage = new Storage();
 const vision = new ImageAnnotatorClient();
@@ -112,7 +113,11 @@ router.post('/upload', authenticateToken, checkUploadQuota, upload.single('image
             );
         }
 
-        res.json({ success: true, item: dbRes.rows[0], ai_tags: tags });
+        const newItem = dbRes.rows[0];
+        res.json({ success: true, item: newItem, ai_tags: tags });
+
+        // Fire-and-forget: generate matches asynchronously after responding
+        setImmediate(() => generateMatchesForItem(newItem.id));
 
     } catch (err) {
         console.error('[items] Upload error:', err.message);
