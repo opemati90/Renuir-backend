@@ -1,0 +1,80 @@
+steps:
+  # 1. Build the Container Image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/$_SERVICE_NAME:$COMMIT_SHA', '.']
+
+  # 2. Push the Image to Google Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/$_SERVICE_NAME:$COMMIT_SHA']
+
+  # 3. Deploy to Cloud Run (Dynamic Service & DB)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - '$_SERVICE_NAME'   # <--- Dynamic (renuir-api vs renuir-api-staging)
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/$_SERVICE_NAME:$COMMIT_SHA'
+      - '--region'
+      - 'us-central1'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--port'
+      - '8080'
+      - '--memory'
+      - '1Gi'
+      
+      # --- Database Connection (Dynamic) ---
+      - '--add-cloudsql-instances'
+      - '$_DB_INSTANCE'    # <--- Dynamic DB Connection Name
+      
+      # --- Standard Config ---
+      - '--set-env-vars'
+      #- 'NODE_ENV=$_NODE_ENV'
+      - 'NODE_ENV=production'
+      - '--set-env-vars'
+      - 'GOOGLE_CLOUD_PROJECT=$PROJECT_ID'
+      - '--set-env-vars'
+      - 'BUCKET_NAME=renuirbucket' # We share the bucket or make it dynamic too
+      
+      # --- Database Vars ---
+      - '--set-env-vars'
+      - 'INSTANCE_CONNECTION_NAME=$_DB_INSTANCE' # <--- Dynamic
+      - '--set-env-vars'
+      - 'DB_HOST=/cloudsql/$_DB_INSTANCE' 
+      
+      - '--set-env-vars'
+      - 'DB_PORT=$_DB_PORT'
+
+      - '--set-env-vars'
+      - 'DB_USER=postgres'
+      - '--set-env-vars'
+      - 'DB_NAME=$_DB_NAME'  # <--- Dynamic DB Name
+      
+      # --- Email Config ---
+      - '--set-env-vars'
+      - 'SMTP_HOST=smtp.gmail.com'
+      - '--set-env-vars'
+      - 'SMTP_PORT=587'
+      - '--set-env-vars'
+      - 'SMTP_USER=inforenuir@gmail.com'
+
+      # --- SECRETS (Mapped from Trigger) ---
+      - '--set-env-vars'
+      - 'DB_PASS=${_DB_PASS}'
+      - '--set-env-vars'
+      - 'JWT_SECRET=${_JWT_SECRET}'
+      - '--set-env-vars'
+      - 'STRIPE_SECRET_KEY=${_STRIPE_SECRET_KEY}'
+      - '--set-env-vars'
+      - 'STRIPE_WEBHOOK_SECRET=${_STRIPE_WEBHOOK_SECRET}'
+      - '--set-env-vars'
+      - 'SMTP_PASS=${_SMTP_PASS}'
+
+images:
+  - 'gcr.io/$PROJECT_ID/$_SERVICE_NAME:$COMMIT_SHA'
+
+options:
+  defaultLogsBucketBehavior: REGIONAL_USER_OWNED_BUCKET
