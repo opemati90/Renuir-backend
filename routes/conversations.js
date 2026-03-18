@@ -1,7 +1,23 @@
 const express = require('express');
 const router = express.Router();
+const multer = require('multer');
+const { v4: uuidv4 } = require('uuid');
+const { Storage } = require('@google-cloud/storage');
 const { pool } = require('../utils/db');
 const { authenticateToken } = require('../middleware/auth');
+const { sendPushNotification } = require('../utils/pushNotification');
+
+const gcsStorage = new Storage();
+const BUCKET_NAME = process.env.BUCKET_NAME || 'renuirbucket';
+
+const attachmentUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB per file
+    fileFilter: (req, file, cb) => {
+        if (!file.mimetype.startsWith('image/')) return cb(new Error('Images only'));
+        cb(null, true);
+    },
+});
 
 /**
  * GET /api/conversations
@@ -121,6 +137,126 @@ router.post('/', authenticateToken, async (req, res) => {
     } catch (err) {
         console.error('[conversations] POST / error:', err.message);
         res.status(500).json({ error: 'Failed to create conversation' });
+    }
+});
+
+/**
+ * POST /api/conversations/:id/messages/attachments
+ * Upload image attachments to a conversation (max 5)
+ */
+router.post('/:id/messages/attachments', authenticateToken, attachmentUpload.array('images', 5), async (req, res) => {
+    const { id: conversationId } = req.params;
+    const userId = req.user.userId;
+
+    if (!req.files || req.files.length === 0) {
+        return res.status(400).json({ error: 'At least one image required' });
+    }
+
+    try {
+        // Verify user is a participant
+        const convRes = await pool.query(
+            'SELECT id FROM conversations WHERE id = $1 AND (participant_a = $2 OR participant_b = $2)',
+            [conversationId, userId]
+        );
+        if (!convRes.rows[0]) return res.status(403).json({ error: 'Access denied' });
+
+        const urls = [];
+        for (const file of req.files) {
+            const filename = `messages/${conversationId}/${uuidv4()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+            const blob = gcsStorage.bucket(BUCKET_NAME).file(filename);
+            await blob.save(file.buffer, { contentType: file.mimetype, resumable: false });
+            urls.push(`https://storage.googleapis.com/${BUCKET_NAME}/${filename}`);
+        }
+
+        res.json({ success: true, urls });
+    } catch (err) {
+        console.error('[conversations] POST attachments error:', err.message);
+        res.status(500).json({ error: 'Failed to upload attachments' });
+    }
+});
+
+/**
+ * POST /api/conversations/:id/meeting-proposal
+ * Propose a meeting time/place for item exchange
+ */
+router.post('/:id/meeting-proposal', authenticateToken, async (req, res) => {
+    const { id: conversationId } = req.params;
+    const { location, proposed_time, notes } = req.body;
+    const userId = req.user.userId;
+
+    if (!location || !proposed_time) {
+        return res.status(400).json({ error: 'location and proposed_time required' });
+    }
+
+    try {
+        const convRes = await pool.query(
+            `SELECT id, participant_a, participant_b FROM conversations
+             WHERE id = $1 AND (participant_a = $2 OR participant_b = $2)`,
+            [conversationId, userId]
+        );
+        const conv = convRes.rows[0];
+        if (!conv) return res.status(403).json({ error: 'Access denied' });
+
+        // Store as a special system message
+        const content = JSON.stringify({
+            type: 'MEETING_PROPOSAL',
+            location,
+            proposed_time,
+            notes: notes || null,
+            proposed_by: userId,
+            status: 'pending',
+        });
+
+        const msgRes = await pool.query(
+            `INSERT INTO messages (conversation_id, sender_id, content)
+             VALUES ($1, $2, $3) RETURNING *`,
+            [conversationId, userId, content]
+        );
+
+        await pool.query('UPDATE conversations SET last_message_at = NOW() WHERE id = $1', [conversationId]);
+
+        const recipientId = conv.participant_a === userId ? conv.participant_b : conv.participant_a;
+        await sendPushNotification(recipientId, 'Meeting Proposed', `A meeting has been proposed for your item exchange.`);
+
+        res.json({ success: true, message: msgRes.rows[0] });
+    } catch (err) {
+        console.error('[conversations] POST meeting-proposal error:', err.message);
+        res.status(500).json({ error: 'Failed to submit meeting proposal' });
+    }
+});
+
+/**
+ * POST /api/conversations/:id/confirm-meeting
+ * Confirm a previously proposed meeting
+ */
+router.post('/:id/confirm-meeting', authenticateToken, async (req, res) => {
+    const { id: conversationId } = req.params;
+    const userId = req.user.userId;
+
+    try {
+        const convRes = await pool.query(
+            `SELECT id, participant_a, participant_b FROM conversations
+             WHERE id = $1 AND (participant_a = $2 OR participant_b = $2)`,
+            [conversationId, userId]
+        );
+        const conv = convRes.rows[0];
+        if (!conv) return res.status(403).json({ error: 'Access denied' });
+
+        // Post a confirmation message
+        const content = JSON.stringify({ type: 'MEETING_CONFIRMED', confirmed_by: userId });
+        await pool.query(
+            `INSERT INTO messages (conversation_id, sender_id, content) VALUES ($1, $2, $3)`,
+            [conversationId, userId, content]
+        );
+        await pool.query('UPDATE conversations SET last_message_at = NOW() WHERE id = $1', [conversationId]);
+
+        const recipientId = conv.participant_a === userId ? conv.participant_b : conv.participant_a;
+        await sendPushNotification(recipientId, 'Meeting Confirmed', 'The meeting for your item exchange has been confirmed.');
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[conversations] POST confirm-meeting error:', err.message);
+        res.status(500).json({ error: 'Failed to confirm meeting' });
     }
 });
 

@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
+const crypto = require('crypto');
 const admin = require('firebase-admin');
 const { v4: uuidv4 } = require('uuid');
 const nodemailer = require('nodemailer');
@@ -9,7 +11,8 @@ const { authenticateToken } = require('../middleware/auth');
 const { otpSendLimiter, otpVerifyLimiter, authLimiter } = require('../middleware/rateLimiter');
 
 const JWT_SECRET = process.env.JWT_SECRET;
-const JWT_EXPIRY = '7d'; // SEC-08: reduced from 30d
+const JWT_EXPIRY = '7d';
+const OTP_BCRYPT_ROUNDS = 10;
 
 // Nodemailer transporter (debug disabled in production — SEC-10)
 const transporter = nodemailer.createTransport({
@@ -52,7 +55,7 @@ router.post('/verify-token/:productContext', authLimiter, async (req, res) => {
 
         if (!user) {
             const tenantId = uuidv4();
-            const masterkey = Math.floor(1000 + Math.random() * 9000).toString();
+            const masterkey = uuidv4(); // SEC-NEW: UUID replaces weak 4-digit PIN
             const insertQuery = `
                 INSERT INTO users(email, masterkey, tenant_id, credit, is_verified, full_name, role, subscription_status, subscription_plan, firebase_uid)
                 VALUES($1, $2, $3, $4, TRUE, $5, 'user', 'free', 'basic', $6)
@@ -98,14 +101,17 @@ router.post('/otp/send', otpSendLimiter, async (req, res) => {
         return res.status(400).json({ success: false, message: 'Valid email required' });
     }
 
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    // SEC-NEW: crypto.randomInt is cryptographically secure (unlike Math.random)
+    const code = crypto.randomInt(100000, 999999).toString();
+    const codeHash = await bcrypt.hash(code, OTP_BCRYPT_ROUNDS);
     const expiresAt = new Date(Date.now() + 5 * 60000);
 
     try {
+        // Store hash, never the plaintext code
         await pool.query(
             `INSERT INTO otp_codes (email, code, expires_at) VALUES ($1, $2, $3)
              ON CONFLICT (email) DO UPDATE SET code = $2, expires_at = $3`,
-            [email, code, expiresAt]
+            [email, codeHash, expiresAt]
         );
 
         await transporter.sendMail({
@@ -135,12 +141,16 @@ router.post('/otp/verify/:productContext', otpVerifyLimiter, async (req, res) =>
     }
 
     try {
+        // Fetch by email only — compare against stored hash (timing-safe)
         const otpRes = await pool.query(
-            `SELECT * FROM otp_codes WHERE email = $1 AND code = $2 AND expires_at > NOW()`,
-            [email, code]
+            `SELECT * FROM otp_codes WHERE email = $1 AND expires_at > NOW()`,
+            [email]
         );
 
-        if (otpRes.rows.length === 0) {
+        const storedRecord = otpRes.rows[0];
+        const isValid = storedRecord && await bcrypt.compare(code, storedRecord.code);
+
+        if (!isValid) {
             return res.status(400).json({ success: false, message: 'Invalid or expired code' });
         }
 
@@ -151,7 +161,7 @@ router.post('/otp/verify/:productContext', otpVerifyLimiter, async (req, res) =>
 
         if (!user) {
             const tenantId = uuidv4();
-            const masterkey = Math.floor(1000 + Math.random() * 9000).toString();
+            const masterkey = uuidv4(); // SEC-NEW: UUID replaces weak 4-digit PIN
             const newUser = await pool.query(
                 `INSERT INTO users(email, username, masterkey, tenant_id, credit, is_verified, full_name, role, subscription_status, subscription_plan)
                  VALUES($1, $1, $2, $3, 5, TRUE, 'New User', 'user', 'free', 'basic')

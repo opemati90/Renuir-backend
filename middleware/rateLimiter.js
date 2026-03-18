@@ -46,4 +46,28 @@ const b2bRegisterLimiter = rateLimit({
     message: { success: false, message: 'Too many registration attempts.' },
 });
 
-module.exports = { otpSendLimiter, otpVerifyLimiter, authLimiter, b2bRegisterLimiter };
+/**
+ * Item upload: 20 uploads per hour per IP
+ * Prevents spam flooding and GCS/Vision API bill abuse
+ */
+const uploadLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: 'Upload limit reached. Please wait before uploading more items.' },
+});
+
+/**
+ * General API limiter: 300 requests per 15 minutes per IP
+ * Applied globally as a backstop against scraping/DoS
+ */
+const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 300,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: 'Too many requests. Please slow down.' },
+});
+
+module.exports = { otpSendLimiter, otpVerifyLimiter, authLimiter, b2bRegisterLimiter, uploadLimiter, apiLimiter };

@@ -41,6 +41,7 @@ const morgan = require('morgan');
 const { pool } = require('./utils/db');
 const { verifyToken } = require('./middleware/auth');
 const { sendPushNotification } = require('./utils/pushNotification');
+const { apiLimiter } = require('./middleware/rateLimiter');
 
 // ─── Route Modules ────────────────────────────────────────────────────────────
 const authRoutes = require('./routes/auth');
@@ -81,6 +82,7 @@ const corsOptions = {
 // ─── Security Middleware ──────────────────────────────────────────────────────
 app.use(helmet()); // Sets X-Frame-Options, X-XSS-Protection, HSTS, etc.
 app.use(cors(corsOptions));
+app.use(apiLimiter); // Global backstop: 300 req/15min per IP
 app.use(morgan(environment === 'production' ? 'combined' : 'dev'));
 
 // ─── Body Parsing ─────────────────────────────────────────────────────────────

@@ -11,6 +11,7 @@ const { ImageAnnotatorClient } = require('@google-cloud/vision');
 const { pool } = require('../utils/db');
 const { authenticateToken } = require('../middleware/auth');
 const { checkUploadQuota } = require('../middleware/uploadQuota');
+const { uploadLimiter } = require('../middleware/rateLimiter');
 const { generateMatchesForItem } = require('../utils/matching');
 
 const storage = new Storage();
@@ -34,7 +35,7 @@ const VALID_TYPES = ['LOST', 'FOUND'];
  * POST /api/items/upload
  * Upload a lost/found item with image, AI tagging, and geolocation
  */
-router.post('/upload', authenticateToken, checkUploadQuota, upload.single('image'), async (req, res) => {
+router.post('/upload', authenticateToken, uploadLimiter, checkUploadQuota, upload.single('image'), async (req, res) => {
     let tempPath = null;
     try {
         const { title, type, lat, long, zone, description } = req.body;
@@ -337,6 +338,24 @@ router.get('/:id/deep-scan', authenticateToken, async (req, res) => {
     } catch (err) {
         console.error('[items] Deep scan error:', err.message);
         res.status(500).json({ error: 'Deep scan failed' });
+    }
+});
+
+/**
+ * PATCH /api/items/:id/resolve
+ * Mark an item as resolved (owner only)
+ */
+router.patch('/:id/resolve', authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(
+            "UPDATE items SET status = 'RESOLVED', updated_at = NOW() WHERE id = $1 AND user_id = $2 RETURNING id",
+            [req.params.id, req.user.userId]
+        );
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Item not found or not owned by you' });
+        res.json({ success: true, message: 'Item marked as resolved' });
+    } catch (err) {
+        console.error('[items] PATCH /:id/resolve error:', err.message);
+        res.status(500).json({ error: 'Failed to resolve item' });
     }
 });
 
