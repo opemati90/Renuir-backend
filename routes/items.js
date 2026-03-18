@@ -175,7 +175,11 @@ router.get('/user/list', authenticateToken, async (req, res) => {
         const { type, status } = req.query;
         let query = `
             SELECT id, title, type, status, image_filename, is_boosted, created_at, zone,
-                   description, lat, long, normal_address, category
+                   description,
+                   ST_Y(location::geometry) as lat,
+                   ST_X(location::geometry) as lng,
+                   COALESCE(normal_address, address, zone) as normal_address,
+                   category
             FROM items WHERE user_id = $1
         `;
         const values = [req.user.userId];
@@ -207,7 +211,7 @@ router.get('/resolved', authenticateToken, async (req, res) => {
     try {
         const { rows } = await pool.query(
             `SELECT id, title, type, status, image_filename, is_boosted, created_at, zone,
-                    description, normal_address, category
+                    description, COALESCE(normal_address, address, zone) as normal_address, category
              FROM items WHERE user_id = $1 AND status = 'RESOLVED'
              ORDER BY updated_at DESC`,
             [req.user.userId]

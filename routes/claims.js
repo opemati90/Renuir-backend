@@ -325,11 +325,20 @@ router.post('/:id/respond', authenticateToken, async (req, res) => {
         let conversationId = null;
         if (action === 'approve') {
             // Create a conversation between finder and claimant
-            const convRes = await client.query(
-                `INSERT INTO conversations (participant_1, participant_2, item_id)
-                 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING id`,
+            // Try to find existing conversation first (either participant order)
+            const existingConv = await client.query(
+                `SELECT id FROM conversations WHERE item_id = $3
+                 AND ((participant_a = $1 AND participant_b = $2)
+                   OR (participant_a = $2 AND participant_b = $1))`,
                 [userId, claim.claimant_id, claim.item_id]
             );
+            const convRes = existingConv.rowCount > 0
+                ? existingConv
+                : await client.query(
+                    `INSERT INTO conversations (participant_a, participant_b, item_id)
+                     VALUES ($1, $2, $3) RETURNING id`,
+                    [userId, claim.claimant_id, claim.item_id]
+                );
             conversationId = convRes.rows[0]?.id || null;
 
             await client.query(
