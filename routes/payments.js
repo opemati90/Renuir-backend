@@ -20,6 +20,148 @@ const BOOST_PRICES = {
     '7d': 1499,   // €14.99
 };
 
+// Action-based pricing map (cents, EUR)
+const ACTION_PRICES = {
+    'high_visibility': 199,
+    'deep_scan': 299,
+    'extended_area': 399,
+    'boost_24h': 299,
+    'boost_72h': 699,
+    'boost_7d': 1499,
+};
+
+/**
+ * POST /api/payments/create-checkout
+ * Create a Stripe Checkout Session — returns { url } for WebView flow
+ */
+router.post('/create-checkout', authenticateToken, async (req, res) => {
+    const { action, itemId, successUrl, cancelUrl } = req.body;
+    const amount = ACTION_PRICES[action];
+    if (!amount) return res.status(400).json({ error: `Unknown action: ${action}` });
+
+    try {
+        const session = await stripe.checkout.sessions.create({
+            payment_method_types: ['card'],
+            line_items: [{
+                price_data: {
+                    currency: 'eur',
+                    product_data: { name: `Renuir — ${action.replace(/_/g, ' ')}` },
+                    unit_amount: amount,
+                },
+                quantity: 1,
+            }],
+            mode: 'payment',
+            success_url: successUrl || `${process.env.APP_URL || 'https://renuir.com'}/payment-success`,
+            cancel_url: cancelUrl || `${process.env.APP_URL || 'https://renuir.com'}/payment-cancel`,
+            metadata: { action, item_id: itemId || '', user_id: req.user.userId },
+        });
+        res.json({ success: true, url: session.url, session_id: session.id });
+    } catch (err) {
+        console.error('[payments] create-checkout error:', err.message);
+        res.status(500).json({ error: 'Failed to create checkout session' });
+    }
+});
+
+/**
+ * POST /api/payments/create-intent
+ * Create a Stripe PaymentIntent for native Apple/Google Pay — returns { clientSecret }
+ */
+router.post('/create-intent', authenticateToken, async (req, res) => {
+    const { action, itemId } = req.body;
+    const amount = ACTION_PRICES[action];
+    if (!amount) return res.status(400).json({ error: `Unknown action: ${action}` });
+
+    try {
+        const paymentIntent = await stripe.paymentIntents.create({
+            amount,
+            currency: 'eur',
+            metadata: { action, item_id: itemId || '', user_id: req.user.userId },
+            automatic_payment_methods: { enabled: true },
+        });
+        res.json({ success: true, data: { clientSecret: paymentIntent.client_secret }, amount });
+    } catch (err) {
+        console.error('[payments] create-intent error:', err.message);
+        res.status(500).json({ error: 'Failed to create payment intent' });
+    }
+});
+
+/**
+ * POST /api/payments/create-shipping-intent
+ * Create a PaymentIntent for shipping costs
+ */
+router.post('/create-shipping-intent', authenticateToken, async (req, res) => {
+    const { claim_id, amount_cents } = req.body;
+    if (!claim_id) return res.status(400).json({ error: 'claim_id required' });
+    const amount = parseInt(amount_cents) || 599;
+
+    try {
+        const paymentIntent = await stripe.paymentIntents.create({
+            amount,
+            currency: 'eur',
+            metadata: { claim_id, user_id: req.user.userId, type: 'shipping' },
+            automatic_payment_methods: { enabled: true },
+        });
+        res.json({ success: true, data: { clientSecret: paymentIntent.client_secret }, amount });
+    } catch (err) {
+        console.error('[payments] create-shipping-intent error:', err.message);
+        res.status(500).json({ error: 'Failed to create shipping intent' });
+    }
+});
+
+/**
+ * GET /api/stripe/connect/onboard
+ * Start Stripe Connect onboarding for finder payouts
+ */
+router.get('/connect/onboard', authenticateToken, async (req, res) => {
+    try {
+        const userRes = await pool.query('SELECT id, email, stripe_connect_id FROM users WHERE id = $1', [req.user.userId]);
+        const user = userRes.rows[0];
+        if (!user) return res.status(404).json({ error: 'User not found' });
+
+        let accountId = user.stripe_connect_id;
+        if (!accountId) {
+            const account = await stripe.accounts.create({ type: 'express', email: user.email, metadata: { user_id: user.id } });
+            accountId = account.id;
+            await pool.query('UPDATE users SET stripe_connect_id = $1 WHERE id = $2', [accountId, user.id]);
+        }
+
+        const accountLink = await stripe.accountLinks.create({
+            account: accountId,
+            refresh_url: `${process.env.APP_URL || 'https://renuir.com'}/stripe/connect/refresh`,
+            return_url: `${process.env.APP_URL || 'https://renuir.com'}/stripe/connect/return`,
+            type: 'account_onboarding',
+        });
+        res.json({ success: true, url: accountLink.url });
+    } catch (err) {
+        console.error('[payments] connect/onboard error:', err.message);
+        res.status(500).json({ error: 'Failed to start Stripe Connect onboarding' });
+    }
+});
+
+/**
+ * GET /api/stripe/connect/status
+ * Get Stripe Connect account status
+ */
+router.get('/connect/status', authenticateToken, async (req, res) => {
+    try {
+        const userRes = await pool.query('SELECT stripe_connect_id FROM users WHERE id = $1', [req.user.userId]);
+        const connectId = userRes.rows[0]?.stripe_connect_id;
+        if (!connectId) return res.json({ success: true, connected: false, charges_enabled: false });
+
+        const account = await stripe.accounts.retrieve(connectId);
+        res.json({
+            success: true,
+            connected: true,
+            charges_enabled: account.charges_enabled,
+            payouts_enabled: account.payouts_enabled,
+            details_submitted: account.details_submitted,
+        });
+    } catch (err) {
+        console.error('[payments] connect/status error:', err.message);
+        res.status(500).json({ error: 'Failed to get Stripe Connect status' });
+    }
+});
+
 /**
  * POST /api/payments/boost
  * Create a Stripe PaymentIntent for a listing boost

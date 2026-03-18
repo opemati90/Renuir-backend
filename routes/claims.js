@@ -88,6 +88,59 @@ router.post('/:id/claim', authenticateToken, upload.array('proof_photos', 5), as
 });
 
 /**
+ * GET /api/claims/incoming
+ * Claims submitted on the current user's FOUND items (finder view)
+ */
+router.get('/incoming', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    try {
+        const { rows } = await pool.query(
+            `SELECT c.id as claim_id, c.status, c.clue_answer, c.proof_photo_urls as proof_files,
+                    c.created_at, c.finder_note,
+                    i.title as item_title, i.image_filename, i.ownership_clue,
+                    u.id as claimer_id, u.full_name as claimer_name, u.avatar_url as claimer_avatar,
+                    0 as similarity_score
+             FROM claims c
+             JOIN items i ON c.item_id = i.id
+             JOIN users u ON c.claimant_id = u.id
+             WHERE i.user_id = $1
+             ORDER BY c.created_at DESC`,
+            [userId]
+        );
+        res.json({ success: true, claims: rows });
+    } catch (err) {
+        console.error('[claims] GET /incoming error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch incoming claims' });
+    }
+});
+
+/**
+ * GET /api/claims/outgoing
+ * Claims the current user has submitted (claimant view)
+ */
+router.get('/outgoing', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    try {
+        const { rows } = await pool.query(
+            `SELECT c.id as claim_id, c.status, c.clue_answer, c.proof_photo_urls as proof_files,
+                    c.created_at, c.conversation_id,
+                    i.title as item_title, i.type as item_type, i.image_filename, i.ownership_clue,
+                    u.id as founder_id, u.full_name as founder_name, u.avatar_url as founder_avatar
+             FROM claims c
+             JOIN items i ON c.item_id = i.id
+             JOIN users u ON i.user_id = u.id
+             WHERE c.claimant_id = $1
+             ORDER BY c.created_at DESC`,
+            [userId]
+        );
+        res.json({ success: true, claims: rows });
+    } catch (err) {
+        console.error('[claims] GET /outgoing error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch outgoing claims' });
+    }
+});
+
+/**
  * GET /api/claims
  * Get claims relevant to the authenticated user
  * - As finder: claims on my found items
@@ -235,6 +288,132 @@ router.patch('/:id', authenticateToken, async (req, res) => {
         res.status(500).json({ error: 'Failed to update claim' });
     } finally {
         client.release();
+    }
+});
+
+/**
+ * POST /api/claims/:id/respond
+ * Approve or reject a claim (finder only) — matches frontend respondToClaim()
+ */
+router.post('/:id/respond', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const { action, note } = req.body; // action: 'approve' | 'reject'
+    const userId = req.user.userId;
+
+    if (!['approve', 'reject'].includes(action)) {
+        return res.status(400).json({ error: 'Action must be "approve" or "reject"' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const claimRes = await client.query(
+            `SELECT c.*, i.user_id as finder_id, i.title as item_title, i.type as item_type, c.claimant_id
+             FROM claims c JOIN items i ON c.item_id = i.id
+             WHERE c.id = $1`,
+            [id]
+        );
+        const claim = claimRes.rows[0];
+
+        if (!claim) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Claim not found' }); }
+        if (claim.finder_id !== userId) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Only the finder can review this claim' }); }
+        if (claim.status !== 'pending') { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Claim has already been reviewed' }); }
+
+        const newStatus = action === 'approve' ? 'approved' : 'rejected';
+
+        let conversationId = null;
+        if (action === 'approve') {
+            // Create a conversation between finder and claimant
+            const convRes = await client.query(
+                `INSERT INTO conversations (participant_1, participant_2, item_id)
+                 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING id`,
+                [userId, claim.claimant_id, claim.item_id]
+            );
+            conversationId = convRes.rows[0]?.id || null;
+
+            await client.query(
+                "UPDATE items SET status = 'RESOLVED', updated_at = NOW() WHERE id = $1",
+                [claim.item_id]
+            );
+        }
+
+        await client.query(
+            'UPDATE claims SET status = $1, finder_note = $2, reviewed_at = NOW(), conversation_id = $3 WHERE id = $4',
+            [newStatus, note || null, conversationId, id]
+        );
+
+        await client.query('COMMIT');
+
+        const notifTitle = action === 'approve' ? 'Claim Approved!' : 'Claim Update';
+        const notifBody = action === 'approve'
+            ? `Your claim on "${claim.item_title}" was approved.`
+            : `Your claim on "${claim.item_title}" was not approved.${note ? ` Note: ${note}` : ''}`;
+        await sendPushNotification(claim.claimant_id, notifTitle, notifBody);
+
+        res.json({
+            success: true,
+            message: newStatus,
+            item_type: claim.item_type,
+            claimer_id: claim.claimant_id,
+            conversation_id: conversationId,
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('[claims] POST /:id/respond error:', err.message);
+        res.status(500).json({ error: 'Failed to respond to claim' });
+    } finally {
+        client.release();
+    }
+});
+
+/**
+ * POST /api/claims/:id/request-info
+ * Ask the claimant for more information
+ */
+router.post('/:id/request-info', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const { info } = req.body;
+    const userId = req.user.userId;
+
+    if (!info || !info.trim()) return res.status(400).json({ error: 'info message required' });
+
+    try {
+        const result = await pool.query(
+            `SELECT c.claimant_id, i.user_id as finder_id, i.title
+             FROM claims c JOIN items i ON c.item_id = i.id WHERE c.id = $1`,
+            [id]
+        );
+        const claim = result.rows[0];
+        if (!claim) return res.status(404).json({ error: 'Claim not found' });
+        if (claim.finder_id !== userId) return res.status(403).json({ error: 'Unauthorized' });
+
+        await sendPushNotification(claim.claimant_id, 'More info needed', `The finder of "${claim.title}" has requested more information for your claim.`);
+        res.json({ success: true, message: 'Info request sent to claimant' });
+    } catch (err) {
+        console.error('[claims] POST /:id/request-info error:', err.message);
+        res.status(500).json({ error: 'Failed to request info' });
+    }
+});
+
+/**
+ * POST /api/claims/:id/cancel
+ * Cancel a pending claim (claimant only)
+ */
+router.post('/:id/cancel', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const userId = req.user.userId;
+
+    try {
+        const result = await pool.query(
+            'UPDATE claims SET status = $1 WHERE id = $2 AND claimant_id = $3 AND status = $4 RETURNING id',
+            ['cancelled', id, userId, 'pending']
+        );
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Claim not found or cannot be cancelled' });
+        res.json({ success: true, message: 'Claim cancelled' });
+    } catch (err) {
+        console.error('[claims] POST /:id/cancel error:', err.message);
+        res.status(500).json({ error: 'Failed to cancel claim' });
     }
 });
 

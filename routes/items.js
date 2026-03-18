@@ -167,6 +167,59 @@ router.get('/search', async (req, res) => {
 });
 
 /**
+ * GET /api/items/user/list
+ * Get all items posted by the authenticated user (frontend alias)
+ */
+router.get('/user/list', authenticateToken, async (req, res) => {
+    try {
+        const { type, status } = req.query;
+        let query = `
+            SELECT id, title, type, status, image_filename, is_boosted, created_at, zone,
+                   description, lat, long, normal_address, category
+            FROM items WHERE user_id = $1
+        `;
+        const values = [req.user.userId];
+        let idx = 2;
+
+        if (type && VALID_TYPES.includes(type)) {
+            query += ` AND type = $${idx++}`;
+            values.push(type);
+        }
+        if (status) {
+            query += ` AND status = $${idx++}`;
+            values.push(status);
+        }
+
+        query += ' ORDER BY created_at DESC';
+        const { rows } = await pool.query(query, values);
+        res.json({ success: true, items: rows });
+    } catch (err) {
+        console.error('[items] GET /user/list error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch items' });
+    }
+});
+
+/**
+ * GET /api/items/resolved
+ * Get resolved items for the authenticated user
+ */
+router.get('/resolved', authenticateToken, async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            `SELECT id, title, type, status, image_filename, is_boosted, created_at, zone,
+                    description, normal_address, category
+             FROM items WHERE user_id = $1 AND status = 'RESOLVED'
+             ORDER BY updated_at DESC`,
+            [req.user.userId]
+        );
+        res.json({ success: true, data: rows });
+    } catch (err) {
+        console.error('[items] GET /resolved error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch resolved items' });
+    }
+});
+
+/**
  * GET /api/items/user
  * Get all items posted by the authenticated user
  */
@@ -275,6 +328,122 @@ router.get('/:id/deep-scan', authenticateToken, async (req, res) => {
     } catch (err) {
         console.error('[items] Deep scan error:', err.message);
         res.status(500).json({ error: 'Deep scan failed' });
+    }
+});
+
+/**
+ * PATCH /api/items/:id/reopen
+ * Reopen a resolved item (owner only)
+ */
+router.patch('/:id/reopen', authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(
+            "UPDATE items SET status = 'OPEN', updated_at = NOW() WHERE id = $1 AND user_id = $2 RETURNING id",
+            [req.params.id, req.user.userId]
+        );
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Item not found or not owned by you' });
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[items] PATCH /:id/reopen error:', err.message);
+        res.status(500).json({ error: 'Failed to reopen item' });
+    }
+});
+
+/**
+ * PATCH /api/items/:id/hide
+ * Hide an item from public search (owner only)
+ */
+router.patch('/:id/hide', authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(
+            "UPDATE items SET status = 'HIDDEN', updated_at = NOW() WHERE id = $1 AND user_id = $2 RETURNING id",
+            [req.params.id, req.user.userId]
+        );
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Item not found or not owned by you' });
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[items] PATCH /:id/hide error:', err.message);
+        res.status(500).json({ error: 'Failed to hide item' });
+    }
+});
+
+/**
+ * GET /api/items/:id/comments
+ * Get comments for an item
+ */
+router.get('/:id/comments', async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            `SELECT c.id, c.content, c.created_at, c.user_id,
+                    u.full_name as user_name, u.full_name as profile_pic, u.avatar_url as user_avatar
+             FROM item_comments c
+             JOIN users u ON c.user_id = u.id
+             WHERE c.item_id = $1
+             ORDER BY c.created_at ASC`,
+            [req.params.id]
+        );
+        res.json({ success: true, comments: rows });
+    } catch (err) {
+        console.error('[items] GET /:id/comments error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch comments' });
+    }
+});
+
+/**
+ * POST /api/items/:id/comments
+ * Add a comment on an item
+ */
+router.post('/:id/comments', authenticateToken, async (req, res) => {
+    const { content } = req.body;
+    if (!content || content.trim().length < 1) return res.status(400).json({ error: 'Content required' });
+    try {
+        const { rows } = await pool.query(
+            `INSERT INTO item_comments (item_id, user_id, content)
+             VALUES ($1, $2, $3) RETURNING id, content, created_at, user_id`,
+            [req.params.id, req.user.userId, content.trim()]
+        );
+        res.json({ success: true, comment: rows[0] });
+    } catch (err) {
+        console.error('[items] POST /:id/comments error:', err.message);
+        res.status(500).json({ error: 'Failed to add comment' });
+    }
+});
+
+/**
+ * PATCH /api/comments/:commentId
+ * Edit a comment (author only)
+ */
+router.patch('/comments/:commentId', authenticateToken, async (req, res) => {
+    const { content } = req.body;
+    if (!content || content.trim().length < 1) return res.status(400).json({ error: 'Content required' });
+    try {
+        const result = await pool.query(
+            'UPDATE item_comments SET content = $1 WHERE id = $2 AND user_id = $3 RETURNING id',
+            [content.trim(), req.params.commentId, req.user.userId]
+        );
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Comment not found' });
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[items] PATCH /comments/:id error:', err.message);
+        res.status(500).json({ error: 'Failed to update comment' });
+    }
+});
+
+/**
+ * DELETE /api/comments/:commentId
+ * Delete a comment (author only)
+ */
+router.delete('/comments/:commentId', authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(
+            'DELETE FROM item_comments WHERE id = $1 AND user_id = $2 RETURNING id',
+            [req.params.commentId, req.user.userId]
+        );
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Comment not found' });
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[items] DELETE /comments/:id error:', err.message);
+        res.status(500).json({ error: 'Failed to delete comment' });
     }
 });
 

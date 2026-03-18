@@ -7,6 +7,7 @@
  * Sprint history:
  *   Sprint 0: Security hardening (SEC-01 through SEC-14)
  *   Sprint 1: Modular routes, 15 missing endpoints, DB migrations
+ *   Sprint 2: Aligned all API paths with frontend, added matches/timeline/utils/support routes
  */
 
 require('dotenv').config();
@@ -52,6 +53,9 @@ const organizationRoutes = require('./routes/organizations');
 const analyticsRoutes = require('./routes/analytics');
 const paymentRoutes = require('./routes/payments');
 const shippingRoutes = require('./routes/shipping');
+const matchRoutes = require('./routes/matches');
+const timelineRoutes = require('./routes/timeline');
+const utilRoutes = require('./routes/utils');
 
 // ─── Express App ──────────────────────────────────────────────────────────────
 const app = express();
@@ -199,8 +203,16 @@ app.use('/api/b2b', organizationRoutes);
 app.use('/api/org', organizationRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/payments', paymentRoutes);
+app.use('/api/stripe', paymentRoutes);        // /api/stripe/connect/onboard, /status
 app.use('/webhook', paymentRoutes);
 app.use('/api/shipping', shippingRoutes);
+app.use('/api/matches', matchRoutes);
+app.use('/api/timeline', timelineRoutes);
+app.use('/api/utils', utilRoutes);
+app.use('/api/support', utilRoutes);          // POST /api/support/contact
+app.use('/api/user', userRoutes);             // /api/user/notification-settings, /api/user/push-token
+app.use('/api/kyc', userRoutes);              // /api/kyc/start → mounted on /kyc/start in users.js
+app.use('/api/comments', itemRoutes);         // /api/comments/:id (PATCH/DELETE)
 
 // SEC-01: /fix-db route REMOVED — migrations run at startup only
 // Never expose unauthenticated migration execution via HTTP
