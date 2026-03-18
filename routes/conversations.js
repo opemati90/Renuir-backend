@@ -74,7 +74,7 @@ router.get('/:id/messages', authenticateToken, async (req, res) => {
         }
 
         const { rows } = await pool.query(
-            `SELECT m.id, m.content, m.is_read, m.created_at, m.sender_id,
+            `SELECT m.id, m.content, m.is_read, m.is_system_msg, m.created_at, m.sender_id,
                     u.full_name as sender_name
              FROM messages m
              JOIN users u ON m.sender_id = u.id
